@@ -18,6 +18,7 @@ def open_activity(page, activity_title=None):
     print("Expanding activity...")
 
     reader.locator("span[id^='expand_button']").first.wait_for()
+    time.sleep(2)  # Let all expand buttons render and stabilize
     
     if activity_title:
         print(f"Looking for activity matching: '{activity_title}'")
@@ -25,43 +26,38 @@ def open_activity(page, activity_title=None):
         count = buttons.count()
         clicked = False
         
-        # Try direct substring match first
+        # Extract number pattern (e.g. '6-1', '7-2') from the title for precise matching
+        title_number = re.search(r'(\d+-\d+)', activity_title)
+        
+        # Try exact substring match first
         for i in range(count):
             btn = buttons.nth(i)
             aria_label = btn.get_attribute("aria-label") or ""
             text = btn.inner_text() or ""
-            if activity_title.lower() in aria_label.lower() or activity_title.lower() in text.lower():
+            label = aria_label + " " + text
+            if activity_title.lower() in label.lower():
                 print(f"  Found exact matching activity: {aria_label or text}")
-                btn.click()
+                btn.click(force=True)
                 clicked = True
                 break
-                
-        # Fallback to loose word matching if no exact substring
-        if not clicked:
-            title_words = set(activity_title.lower().split())
-            best_match = None
-            best_score = 0
-            best_match_name = ""
+        
+        # Try matching by number pattern (e.g. '7-1')
+        if not clicked and title_number:
+            target_num = title_number.group(1)
             for i in range(count):
                 btn = buttons.nth(i)
-                lbl = (btn.get_attribute("aria-label") or "") + " " + (btn.inner_text() or "")
-                lbl_words = set(lbl.lower().split())
-                score = len(title_words.intersection(lbl_words))
-                if score > best_score:
-                    best_score = score
-                    best_match = btn
-                    best_match_name = lbl
-            
-            if best_match and best_score > 0:
-                print(f"  Found fuzzy matching activity: {best_match_name} (score {best_score})")
-                best_match.click()
-                clicked = True
+                label = (btn.get_attribute("aria-label") or "") + " " + (btn.inner_text() or "")
+                if target_num in label:
+                    print(f"  Found number-matched activity ({target_num}): {label.strip()}")
+                    btn.click(force=True)
+                    clicked = True
+                    break
                 
         if not clicked:
-            print("  Could not find matching activity, falling back to first activity.")
-            reader.locator("span[id^='expand_button']").first.click()
+            print(f"  Could not find matching activity among {count} buttons, falling back to first activity.")
+            reader.locator("span[id^='expand_button']").first.click(force=True)
     else:
-        reader.locator("span[id^='expand_button']").first.click()
+        reader.locator("span[id^='expand_button']").first.click(force=True)
 
     print("Searching all frames for Start/Resume button...")
 
@@ -423,14 +419,16 @@ def main():
 
                 print(f"Finished assignment {idx + 1}: {activity_title}")
 
-                # Close the MindTap tab and Brightspace tab before next assignment
-                mindtap_page.close()
-                page.close()
+                # Close ALL pages to avoid frame pollution on next assignment
+                for p_page in context.pages:
+                    try:
+                        p_page.close()
+                    except Exception:
+                        pass
 
             except Exception as e:
                 print(f"Error on assignment {idx + 1} ({url}): {e}")
                 print("Skipping to next assignment...")
-                # Close any open pages from this attempt
                 for p_page in context.pages:
                     try:
                         p_page.close()
