@@ -1,8 +1,9 @@
+import random
 import re
 import time
 from playwright.sync_api import sync_playwright
 
-BRIGHTSPACE_ACTIVITY_PAGE = "https://purdue.brightspace.com/d2l/le/content/1497788/viewContent/21194391/View"
+BRIGHTSPACE_ACTIVITY_PAGE = "https://purdue.brightspace.com/d2l/le/content/1497788/viewContent/21194389/View"
 
 
 def open_activity(page, activity_title=None):
@@ -84,6 +85,57 @@ def open_activity(page, activity_title=None):
     return mindapp
 
 
+def open_quiz(page):
+    """Open a quiz on the MindTap page. Searches all frames for the Start button."""
+
+    print("Waiting for MindTap quiz page to fully load...")
+    page.wait_for_load_state("networkidle")
+    time.sleep(3)  # Extra buffer for quiz redirects to settle
+
+    print("Searching all frames for Start/Resume button...")
+
+    # Try the main page first
+    all_targets = [("main page", page)]
+
+    # Collect all frames
+    for f in page.frames:
+        all_targets.append((f.url or f.name or "unnamed frame", f))
+
+    quiz_frame = None
+    for name, target in all_targets:
+        try:
+            btn = target.locator("#startButton")
+            if btn.count() > 0:
+                print(f"  Found Start button in: {name}")
+                btn.first.click()
+                quiz_frame = target
+                break
+        except Exception:
+            continue
+
+    if quiz_frame is None:
+        # Maybe frames haven't loaded yet, wait and retry
+        print("  Start button not found yet. Waiting 5 more seconds and retrying...")
+        time.sleep(5)
+        for f in page.frames:
+            try:
+                btn = f.locator("#startButton")
+                if btn.count() > 0:
+                    print(f"  Found Start button in frame: {f.url or f.name}")
+                    btn.first.click()
+                    quiz_frame = f
+                    break
+            except Exception:
+                continue
+
+    if quiz_frame is None:
+        raise Exception("Could not find #startButton in any frame on the quiz page.")
+
+    print("  Waiting for quiz answers to load...")
+    quiz_frame.locator("input[type='radio']:visible").first.wait_for(timeout=15000)
+    return quiz_frame
+
+
 def get_question_progress(frame):
     """Parse 'Question X of Y' from #takeQuestionNumber. Returns (current, total) or None."""
     nav_info = frame.locator("#takeQuestionNumber:visible")
@@ -125,8 +177,11 @@ def solve_quiz(frame):
             print("No visible answers found.")
             break
 
+        # Randomize the order we try answer choices
+        indices = random.sample(range(count), count)
+
         found_correct = False
-        for i in range(count):
+        for i in indices:
 
             radios.nth(i).click(force=True)
 
@@ -137,7 +192,7 @@ def solve_quiz(frame):
             # Wait for fresh feedback to appear
             feedback_el = frame.locator(".feedbackWidgetOverallRejoinder:visible").first
             feedback_el.wait_for(timeout=5000)
-            time.sleep(0.5)
+            time.sleep(0.15)
 
             feedback = feedback_el.inner_text()
 
@@ -185,8 +240,8 @@ def solve_quiz(frame):
                 # Check for transition
                 waited = 0
                 while waited < max_wait_per_click:
-                    time.sleep(0.5)
-                    waited += 0.5
+                    time.sleep(0.25)
+                    waited += 0.25
                     new_progress = get_question_progress(frame)
                     if new_progress and new_progress[0] == expected_q:
                         clicked_successfully = True
@@ -204,7 +259,7 @@ def solve_quiz(frame):
 
         # Wait for new radio buttons to appear
         frame.locator("input[type='radio']:visible").first.wait_for()
-        time.sleep(0.5)
+        time.sleep(0.15)
 
 
 
@@ -214,7 +269,7 @@ def main():
 
         print("Launching browser with saved Brightspace login...")
 
-        browser = p.chromium.launch(headless=False, slow_mo=20)
+        browser = p.chromium.launch(headless=False, slow_mo=0)
 
         context = browser.new_context(
             storage_state="brightspace_auth.json"
@@ -242,16 +297,23 @@ def main():
             activity_title = page.title().split("-")[0].strip()
         print(f"  Detected title: '{activity_title}'")
 
-        print("Opening MindTap activity...")
+        # Detect assignment type: quiz vs listening activity
+        is_quiz = bool(re.search(r'chapter\s+\d+\s+quiz', activity_title, re.IGNORECASE))
+
+        print("Opening MindTap assignment...")
 
         with context.expect_page() as new_page_info:
             page.locator("text=Open in New Window").click()
 
         mindtap_page = new_page_info.value
-
         mindtap_page.wait_for_load_state()
 
-        quiz_frame = open_activity(mindtap_page, activity_title)
+        if is_quiz:
+            print(f"Detected QUIZ: '{activity_title}'")
+            quiz_frame = open_quiz(mindtap_page)
+        else:
+            print(f"Detected ACTIVITY: '{activity_title}'")
+            quiz_frame = open_activity(mindtap_page, activity_title)
 
         solve_quiz(quiz_frame)
 
