@@ -23,7 +23,7 @@ python save_brightspace_login.py
 
 ## 2. Add Assignments
 
-Find the Brightspace links for the assignments you want to complete and add them to the `assignments.txt` file (one URL per line). You can use `#` to comment out lines.
+Find the Brightspace links for the assignments you want to complete and add them to the `assignments.txt` file (one URL per line). You can use `#` to comment out lines. The assignment links should be either links to "Listening Practice Activities" or "Chapter Quizzes".
 
 Example `assignments.txt`:
 ```text
