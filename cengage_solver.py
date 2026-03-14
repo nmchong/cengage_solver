@@ -1,9 +1,10 @@
+import os
 import random
 import re
 import time
 from playwright.sync_api import sync_playwright
 
-BRIGHTSPACE_ACTIVITY_PAGE = "https://purdue.brightspace.com/d2l/le/content/1497788/viewContent/21194391/View"
+ASSIGNMENTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assignments.txt")
 
 
 def open_activity(page, activity_title=None):
@@ -97,7 +98,7 @@ def open_quiz(page):
 
     print("Waiting for MindTap quiz page to fully load...")
     page.wait_for_load_state("networkidle")
-    time.sleep(3)  # Extra buffer for quiz redirects to settle
+    time.sleep(1)  # Brief buffer for quiz redirects to settle
 
     print("Searching all frames for Start/Resume button...")
 
@@ -122,8 +123,8 @@ def open_quiz(page):
 
     if quiz_frame is None:
         # Maybe frames haven't loaded yet, wait and retry
-        print("  Start button not found yet. Waiting 5 more seconds and retrying...")
-        time.sleep(5)
+        print("  Start button not found yet. Waiting 2 more seconds and retrying...")
+        time.sleep(2)
         for f in page.frames:
             try:
                 btn = f.locator("#startButton")
@@ -174,11 +175,6 @@ def solve_quiz(frame):
             print("Could not determine question progress. Stopping.")
             break
 
-        # Clear any stale feedback from previous attempts by hiding it
-        feedback_el = frame.locator(".feedbackWidgetOverallRejoinder:visible")
-        if feedback_el.count() > 0:
-            pass # We'll just read fresh feedback after clicking Check My Work
-
         radios = frame.locator("input[type='radio']:visible")
         count = radios.count()
 
@@ -191,23 +187,34 @@ def solve_quiz(frame):
         max_passes = 3
 
         for pass_num in range(max_passes):
-            # On first pass, try all in random order; on retries, try all again with more delay
             indices = random.sample(range(count), count)
-            delay = 0.65 + (pass_num * 0.3)  # 0.65s, 0.95s, 1.25s
+            delay = 1.0 + (pass_num * 0.3)
 
             for i in indices:
+                # Click the radio button
                 radios.nth(i).click(force=True)
+                time.sleep(0.3)
 
-                # Wait for Check My Work to be visible and click it
-                check_btn = frame.locator(".check-my-work-link:visible").first
-                check_btn.click(force=True)
+                # Click Check My Work — wait for it to appear first
+                try:
+                    check_btn = frame.locator(".check-my-work-link:visible").first
+                    check_btn.wait_for(timeout=10000)
+                    check_btn.click(force=True)
+                except Exception:
+                    print(f"  Choice {i + 1}: Could not click Check My Work. Skipping.")
+                    tried_indices.add(i)
+                    continue
 
-                # Wait for fresh feedback to appear
-                feedback_el = frame.locator(".feedbackWidgetOverallRejoinder:visible").first
-                feedback_el.wait_for(timeout=5000)
-                time.sleep(delay)
-
-                feedback = feedback_el.inner_text()
+                # Wait for feedback to appear (may take a moment on quizzes)
+                try:
+                    feedback_el = frame.locator(".feedbackWidgetOverallRejoinder:visible").first
+                    feedback_el.wait_for(timeout=15000)
+                    time.sleep(delay)
+                    feedback = feedback_el.inner_text()
+                except Exception:
+                    print(f"  Choice {i + 1}: Feedback timed out. Skipping.")
+                    tried_indices.add(i)
+                    continue
 
                 if "Incorrect" not in feedback:
                     print(f"  Correct answer found (choice {i + 1}).")
@@ -337,12 +344,26 @@ def solve_quiz(frame):
 
         # Wait for new radio buttons to appear
         frame.locator("input[type='radio']:visible").first.wait_for()
-        time.sleep(0.15)
+        time.sleep(1)  # Let old feedback clear before trying new question
 
 
 
 def main():
     
+    # Read assignment URLs from file
+    if not os.path.exists(ASSIGNMENTS_FILE):
+        print(f"Error: {ASSIGNMENTS_FILE} not found.")
+        return
+
+    with open(ASSIGNMENTS_FILE, "r") as f:
+        urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+    if not urls:
+        print("No assignment URLs found in assignments.txt.")
+        return
+
+    print(f"Found {len(urls)} assignment(s) to solve.")
+
     with sync_playwright() as p:
 
         print("Launching browser with saved Brightspace login...")
@@ -353,49 +374,72 @@ def main():
             storage_state="brightspace_auth.json"
         )
 
-        page = context.new_page()
+        for idx, url in enumerate(urls):
+            print(f"\n{'='*60}")
+            print(f"Assignment {idx + 1} of {len(urls)}: {url}")
+            print(f"{'='*60}")
 
-        print("Opening Brightspace page...")
-        page.goto(BRIGHTSPACE_ACTIVITY_PAGE)
-        page.wait_for_load_state()
+            try:
+                page = context.new_page()
 
-        print("Detecting Brightspace activity title...")
-        title_loc = page.locator(".d2l-page-title")
-        activity_title = None
-        if title_loc.count() > 0:
-            activity_title = title_loc.first.inner_text().strip()
-        
-        # Fallback in case of layout changes
-        if not activity_title:
-            title_loc = page.locator("h1, h2")
-            if title_loc.count() > 0:
-                activity_title = title_loc.first.inner_text().strip()
-        
-        if not activity_title:
-            activity_title = page.title().split("-")[0].strip()
-        print(f"  Detected title: '{activity_title}'")
+                print("Opening Brightspace page...")
+                page.goto(url)
+                page.wait_for_load_state()
 
-        # Detect assignment type: quiz vs listening activity
-        is_quiz = bool(re.search(r'chapter\s+\d+\s+quiz', activity_title, re.IGNORECASE))
+                print("Detecting Brightspace activity title...")
+                title_loc = page.locator(".d2l-page-title")
+                activity_title = None
+                if title_loc.count() > 0:
+                    activity_title = title_loc.first.inner_text().strip()
+                
+                if not activity_title:
+                    title_loc = page.locator("h1, h2")
+                    if title_loc.count() > 0:
+                        activity_title = title_loc.first.inner_text().strip()
+                
+                if not activity_title:
+                    activity_title = page.title().split("-")[0].strip()
+                print(f"  Detected title: '{activity_title}'")
 
-        print("Opening MindTap assignment...")
+                # Detect assignment type: quiz vs listening activity
+                is_quiz = bool(re.search(r'chapter\s+\d+\s+quiz', activity_title, re.IGNORECASE))
 
-        with context.expect_page() as new_page_info:
-            page.locator("text=Open in New Window").click()
+                print("Opening MindTap assignment...")
 
-        mindtap_page = new_page_info.value
-        mindtap_page.wait_for_load_state()
+                with context.expect_page() as new_page_info:
+                    page.locator("text=Open in New Window").click()
 
-        if is_quiz:
-            print(f"Detected QUIZ: '{activity_title}'")
-            quiz_frame = open_quiz(mindtap_page)
-        else:
-            print(f"Detected ACTIVITY: '{activity_title}'")
-            quiz_frame = open_activity(mindtap_page, activity_title)
+                mindtap_page = new_page_info.value
+                mindtap_page.wait_for_load_state()
 
-        solve_quiz(quiz_frame)
+                if is_quiz:
+                    print(f"Detected QUIZ: '{activity_title}'")
+                    quiz_frame = open_quiz(mindtap_page)
+                else:
+                    print(f"Detected ACTIVITY: '{activity_title}'")
+                    quiz_frame = open_activity(mindtap_page, activity_title)
 
-        print("Finished.")
+                solve_quiz(quiz_frame)
+
+                print(f"Finished assignment {idx + 1}: {activity_title}")
+
+                # Close the MindTap tab and Brightspace tab before next assignment
+                mindtap_page.close()
+                page.close()
+
+            except Exception as e:
+                print(f"Error on assignment {idx + 1} ({url}): {e}")
+                print("Skipping to next assignment...")
+                # Close any open pages from this attempt
+                for p_page in context.pages:
+                    try:
+                        p_page.close()
+                    except Exception:
+                        pass
+
+        print(f"\n{'='*60}")
+        print(f"All {len(urls)} assignment(s) processed!")
+        print(f"{'='*60}")
 
         input("Press Enter to close browser.")
 
