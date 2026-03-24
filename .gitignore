@@ -2,3 +2,7 @@ brightspace_profile/
 brightspace_auth.json
 .DS_Store
 .env
+__pycache__
+.venv
+assignments.txt
+docs/

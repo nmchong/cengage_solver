@@ -3,9 +3,14 @@ import random
 import re
 import time
 from playwright.sync_api import sync_playwright
+from llm_client import get_ranking
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 ASSIGNMENTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assignments.txt")
-
+console = Console()
 
 def open_activity(page, activity_title=None):
 
@@ -154,7 +159,7 @@ def get_question_progress(frame):
 
 def solve_quiz(frame):
 
-    print("Solving quiz...")
+    console.print(Panel("[bold cyan]Starting Quiz Solver[/bold cyan]", border_style="cyan"))
 
     frame.locator("input[type='radio']:visible").first.wait_for()
 
@@ -166,73 +171,187 @@ def solve_quiz(frame):
         progress = get_question_progress(frame)
         if progress:
             current_q, total_q = progress
-            print(f"--- Question {current_q} of {total_q} ---")
+            console.print(f"\n[bold reverse] --- Question {current_q} of {total_q} --- [/bold reverse]")
         else:
-            print("Could not determine question progress. Stopping.")
+            console.print("[bold red]Could not determine question progress. Stopping.[/bold red]")
             break
 
         radios = frame.locator("input[type='radio']:visible")
         count = radios.count()
 
         if count == 0:
-            print("No visible answers found.")
+            console.print("[yellow]No visible answers found.[/yellow]")
             break
+
+        # Extract question text
+        question_text = ""
+        try:
+            q_selectors = [
+                "#takeQuestionText", 
+                ".question-text", 
+                ".questionText", 
+                ".q-text",
+                ".problemTypes",
+                "div[id$='_question']"
+            ]
+            for sel in q_selectors:
+                loc = frame.locator(sel)
+                if loc.count() > 0:
+                    question_text = loc.first.inner_text().strip()
+                    if question_text:
+                        console.print(f"  [dim]Extracted question using '{sel}':[/dim] [italic]{question_text[:100]}...[/italic]")
+                        break
+            if not question_text:
+                console.print("  [dim red]Failed to extract question text with any selector.[/dim red]")
+        except Exception as e:
+            console.print(f"  [red]Error extracting question text: {e}[/red]")
+
+        # Extract answer labels
+        labels = []
+        for i in range(count):
+            label_text = f"Choice {i+1}"
+            try:
+                radio = radios.nth(i)
+                radio_id = radio.get_attribute("id")
+                if radio_id:
+                    label_loc = frame.locator(f"label[for='{radio_id}']")
+                    if label_loc.count() > 0:
+                        label_text = label_loc.first.inner_text().strip()
+                
+                if not label_text or label_text == f"Choice {i+1}":
+                    label_text = radio.evaluate("el => el.parentElement.innerText").strip()
+            except Exception:
+                pass
+            labels.append(label_text)
+        
+        # Display choices in a table
+        table = Table(title="Answer Choices", show_header=False, box=None)
+        for i, label in enumerate(labels):
+            table.add_row(f"[bold]{i+1}.[/bold]", label)
+        console.print(table)
+
+        # Extract page context (e.g. from container-page)
+        page_context = ""
+        try:
+            # Context selectors: prioritize the active section and content area
+            context_selectors = [".content", ".container.page", ".container-page", ".activity-container", "#activity-container", "main"]
+            for sel in context_selectors:
+                loc = frame.locator(sel)
+                if loc.count() > 0:
+                    page_context = loc.first.inner_text().strip()
+                    if page_context:
+                        console.print(f"  [dim]Extracted context ({len(page_context)} chars) from current frame using '{sel}'[/dim]")
+                        break
+            
+            # If not found, check the parent frames
+            if not page_context:
+                page_ref = frame.page if hasattr(frame, 'page') else frame
+                for f in page_ref.frames:
+                    if f == frame: continue
+                    for sel in context_selectors:
+                        try:
+                            loc = f.locator(sel)
+                            if loc.count() > 0:
+                                text = loc.first.inner_text().strip()
+                                if text and len(text) > 100:
+                                    page_context = text
+                                    console.print(f"  [dim]Extracted context ({len(page_context)} chars) from frame '{f.name or 'unnamed'}' using '{sel}'[/dim]")
+                                    break
+                        except Exception:
+                            continue
+                    if page_context:
+                        break
+        except Exception as e:
+            console.print(f"  [dim red]Error extracting page context: {e}[/dim red]")
+
+        if page_context:
+            page_context = page_context[:4000]
+        else:
+            console.print("  [dim yellow]No page context found in any frame.[/dim yellow]")
+
+        # Get ranking from LLM
+        llm_indices = []
+        has_real_labels = any(l for l in labels if l and not l.startswith("Choice "))
+        if question_text and has_real_labels:
+            console.print("  [bold blue]Asking LLM to rank choices...[/bold blue]")
+            try:
+                llm_indices = get_ranking(question_text, labels, page_context=page_context)
+            except Exception as e:
+                console.print(f"  [bold red]LLM ranking failed: {e}[/bold red]")
+                llm_indices = []
+        else:
+            reason = "Missing question text" if not question_text else "No descriptive labels"
+            console.print(f"  [dim yellow]Skipping LLM ranking: {reason}[/dim yellow]")
 
         found_correct = False
         tried_indices = set()
         max_passes = 3
 
         for pass_num in range(max_passes):
-            indices = random.sample(range(count), count)
+            is_valid_ranking = (
+                llm_indices and 
+                len(llm_indices) == count and 
+                sorted(llm_indices) == list(range(count))
+            )
+            
+            if pass_num == 0 and is_valid_ranking:
+                indices = llm_indices
+                mode_desc = "[bold green]LLM-Ranked Order[/bold green]"
+            else:
+                indices = random.sample(range(count), count)
+                mode_desc = f"[bold yellow]Random Pass {pass_num+1}[/bold yellow]"
+            
+            console.print(f"  [bold cyan]Attempting: {mode_desc}[/bold cyan]")
             delay = 1.0 + (pass_num * 0.3)
 
             for i in indices:
                 # Click the radio button
+                console.print(f"    - Testing choice [bold]{i+1}[/bold]...", end="")
                 radios.nth(i).click(force=True)
                 time.sleep(0.3)
 
-                # Click Check My Work — wait for it to appear first
+                # Click Check My Work
                 try:
                     check_btn = frame.locator(".check-my-work-link:visible").first
                     check_btn.wait_for(timeout=10000)
                     check_btn.click(force=True)
                 except Exception:
-                    print(f"  Choice {i + 1}: Could not click Check My Work. Skipping.")
+                    console.print(" [red]Failed to click 'Check My Work'[/red]")
                     tried_indices.add(i)
                     continue
 
-                # Wait for feedback to appear (may take a moment on quizzes)
+                # Wait for feedback
                 try:
                     feedback_el = frame.locator(".feedbackWidgetOverallRejoinder:visible").first
                     feedback_el.wait_for(timeout=15000)
                     time.sleep(delay)
                     feedback = feedback_el.inner_text()
                 except Exception:
-                    print(f"  Choice {i + 1}: Feedback timed out. Skipping.")
+                    console.print(" [red]Feedback timeout[/red]")
                     tried_indices.add(i)
                     continue
 
                 if "Incorrect" not in feedback:
-                    print(f"  Correct answer found (choice {i + 1}).")
+                    console.print(" [bold green]CORRECT![/bold green]")
                     found_correct = True
                     break
                 else:
-                    print(f"  Choice {i + 1}: Incorrect")
+                    console.print(" [dim red]Incorrect[/dim red]")
                     tried_indices.add(i)
 
             if found_correct:
                 break
             else:
-                print(f"  Pass {pass_num + 1}/{max_passes} exhausted. Retrying with longer delay...")
+                console.print(f"  [bold yellow]Pass {pass_num + 1} exhausted. Retrying...[/bold yellow]")
 
         if not found_correct:
             all_correct = False
-            print("  WARNING: Could not find correct answer for this question.")
+            console.print("  [bold red]WARNING: Could not find correct answer for this question.[/bold red]")
 
         # Check if we're on the last question
         if current_q >= total_q:
             if all_correct:
-                print("All questions answered correctly! Submitting assignment...")
+                console.print("[bold green]All questions answered correctly! Submitting...[/bold green]")
                 try:
                     submitted = False
 
@@ -248,7 +367,7 @@ def solve_quiz(frame):
                         try:
                             btn = frame.locator(sel)
                             if btn.count() > 0:
-                                print(f"  Found submit button with selector: {sel}")
+                                console.print(f"  [dim]Found submit button with selector: {sel}[/dim]")
                                 btn.first.click(force=True)
                                 submitted = True
                                 break
@@ -261,9 +380,8 @@ def solve_quiz(frame):
                         if nav_info.count() > 0:
                             box = nav_info.first.bounding_box()
                             if box:
-                                print("  Submit button not found by selector. Pixel scanning above question banner...")
+                                console.print("  [dim]Submit button not found by selector. Pixel scanning above question banner...[/dim]")
                                 for y_offset in range(10, 200, 10):
-                                    print(f"    Trying {y_offset}px above banner...")
                                     nav_info.first.click(
                                         position={"x": box["width"] / 2, "y": -y_offset},
                                         force=True
@@ -275,7 +393,6 @@ def solve_quiz(frame):
                     if submitted:
                         time.sleep(2)
                         # Click center of viewport to focus the popup dialog, then press Enter
-                        print("  Clicking center of screen and pressing Enter to confirm submission...")
                         page_ref = frame.page if hasattr(frame, 'page') else frame
                         viewport = page_ref.viewport_size
                         if viewport:
@@ -283,26 +400,25 @@ def solve_quiz(frame):
                         time.sleep(0.5)
                         page_ref.keyboard.press("Enter")
                         time.sleep(1)
-                        print("Assignment submitted successfully!")
+                        console.print("[bold green]Assignment submitted successfully![/bold green]")
                     else:
-                        print("Could not find submit button. Please submit manually.")
+                        console.print("[bold yellow]Could not find submit button. Please submit manually.[/bold yellow]")
                 except Exception as e:
-                    print(f"  Auto-submit failed: {e}. Please submit manually.")
+                    console.print(f"  [red]Auto-submit failed: {e}. Please submit manually.[/red]")
             else:
-                print("Reached final question but not all answers were correct. Skipping auto-submit.")
+                console.print("[bold yellow]Reached final question but not all answers were correct. Skipping auto-submit.[/bold yellow]")
             break
 
         # Navigate to next question using coordinate-based click on the banner
-        print(f"Navigating to question {current_q + 1}...")
+        console.print(f"[cyan]Navigating to question {current_q + 1}...[/cyan]")
 
         nav_info = frame.locator("#takeQuestionNumber:visible")
         if nav_info.count() == 0:
-            print("Could not find '#takeQuestionNumber'. Stopping.")
+            console.print("[bold red]Could not find '#takeQuestionNumber'. Stopping.[/bold red]")
             break
             
         box = nav_info.first.bounding_box()
         if box:
-            print("  Clicking right edge of #takeQuestionNumber banner (guess and check)...")
             clicked_successfully = False
             expected_q = current_q + 1
             max_wait_per_click = 0.75  # seconds
@@ -315,7 +431,6 @@ def solve_quiz(frame):
                     offsets.append(8 - i * 2)
 
             for offset in offsets:
-                print(f"    Trying click offset: {offset}px from right edge...")
                 nav_info.first.click(position={"x": box["width"] - offset, "y": box["height"] / 2}, force=True)
                 
                 # Check for transition
@@ -329,13 +444,12 @@ def solve_quiz(frame):
                         break
                         
                 if clicked_successfully:
-                    print(f"    Success! Transitioned to Question {expected_q}.")
                     break
                     
             if not clicked_successfully:
-                print(f"  Warning: Exhausted coordinate clicking without detecting transition to Question {expected_q}. Attempting to continue...")
+                console.print(f"  [bold yellow]Warning: Detecting transition to Question {expected_q} failed.[/bold yellow]")
         else:
-            print("  Could not determine bounding box for #takeQuestionNumber. Cannot coordinate-click.")
+            console.print("[bold red]Could not determine bounding box for #takeQuestionNumber.[/bold red]")
             break
 
         # Wait for new radio buttons to appear
@@ -348,21 +462,33 @@ def main():
     
     # Read assignment URLs from file
     if not os.path.exists(ASSIGNMENTS_FILE):
-        print(f"Error: {ASSIGNMENTS_FILE} not found.")
+        console.print(f"[bold red]Error: {ASSIGNMENTS_FILE} not found.[/bold red]")
         return
 
     with open(ASSIGNMENTS_FILE, "r") as f:
-        urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        urls = []
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            
+            # Extract URL: look for http/https in the line
+            match = re.search(r'(https?://\S+)', line)
+            if match:
+                urls.append(match.group(1))
+            else:
+                # Fallback to the whole line if no protocol found but it's not a comment
+                urls.append(line)
 
     if not urls:
-        print("No assignment URLs found in assignments.txt.")
+        console.print("[bold yellow]No assignment URLs found in assignments.txt.[/bold yellow]")
         return
 
-    print(f"Found {len(urls)} assignment(s) to solve.")
+    console.print(f"[bold green]Found {len(urls)} assignment(s) to solve.[/bold green]")
 
     with sync_playwright() as p:
 
-        print("Launching browser with saved Brightspace login...")
+        console.print("Launching browser with saved Brightspace login...")
 
         browser = p.chromium.launch(headless=False, slow_mo=0)
 
@@ -371,18 +497,18 @@ def main():
         )
 
         for idx, url in enumerate(urls):
-            print(f"\n{'='*60}")
-            print(f"Assignment {idx + 1} of {len(urls)}: {url}")
-            print(f"{'='*60}")
+            console.print(f"\n[bold magenta]{'='*60}[/bold magenta]")
+            console.print(f"[bold magenta]Assignment {idx + 1} of {len(urls)}: {url}[/bold magenta]")
+            console.print(f"[bold magenta]{'='*60}[/bold magenta]")
 
             try:
                 page = context.new_page()
 
-                print("Opening Brightspace page...")
+                console.print("Opening Brightspace page...")
                 page.goto(url)
                 page.wait_for_load_state()
 
-                print("Detecting Brightspace activity title...")
+                console.print("Detecting Brightspace activity title...")
                 title_loc = page.locator(".d2l-page-title")
                 activity_title = None
                 if title_loc.count() > 0:
@@ -395,12 +521,12 @@ def main():
                 
                 if not activity_title:
                     activity_title = page.title().split("-")[0].strip()
-                print(f"  Detected title: '{activity_title}'")
+                console.print(f"  Detected title: '[bold cyan]{activity_title}[/bold cyan]'")
 
                 # Detect assignment type: quiz vs listening activity
                 is_quiz = bool(re.search(r'chapter\s+\d+\s+quiz', activity_title, re.IGNORECASE))
 
-                print("Opening MindTap assignment...")
+                console.print("Opening MindTap assignment...")
 
                 with context.expect_page() as new_page_info:
                     page.locator("text=Open in New Window").click()
@@ -409,15 +535,15 @@ def main():
                 mindtap_page.wait_for_load_state()
 
                 if is_quiz:
-                    print(f"Detected QUIZ: '{activity_title}'")
+                    console.print(f"Detected [bold yellow]QUIZ[/bold yellow]: '{activity_title}'")
                     quiz_frame = open_quiz(mindtap_page)
                 else:
-                    print(f"Detected ACTIVITY: '{activity_title}'")
+                    console.print(f"Detected [bold yellow]ACTIVITY[/bold yellow]: '{activity_title}'")
                     quiz_frame = open_activity(mindtap_page, activity_title)
 
                 solve_quiz(quiz_frame)
 
-                print(f"Finished assignment {idx + 1}: {activity_title}")
+                console.print(f"[bold green]Finished assignment {idx + 1}: {activity_title}[/bold green]")
 
                 # Close ALL pages to avoid frame pollution on next assignment
                 for p_page in context.pages:
@@ -427,17 +553,17 @@ def main():
                         pass
 
             except Exception as e:
-                print(f"Error on assignment {idx + 1} ({url}): {e}")
-                print("Skipping to next assignment...")
+                console.print(f"[bold red]Error on assignment {idx + 1} ({url}): {e}[/bold red]")
+                console.print("Skipping to next assignment...")
                 for p_page in context.pages:
                     try:
                         p_page.close()
                     except Exception:
                         pass
 
-        print(f"\n{'='*60}")
-        print(f"All {len(urls)} assignment(s) processed!")
-        print(f"{'='*60}")
+        console.print(f"\n[bold magenta]{'='*60}[/bold magenta]")
+        console.print(f"[bold magenta]All {len(urls)} assignment(s) processed![/bold magenta]")
+        console.print(f"[bold magenta]{'='*60}[/bold magenta]")
 
         input("Press Enter to close browser.")
 
